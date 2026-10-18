@@ -562,6 +562,312 @@ std::vector<uint8_t> raw_shellcode() {
                              "raw shellcode mode is not yet implemented");
 }
 
+// ---------------------------------------------------------------------------
+// hide_shellcode  –  Post-injection stage that hides library segments from
+// /proc/self/maps by remapping file-backed pages to anonymous and labelling
+// them [anon:jit-cache] via prctl(PR_SET_VMA).
+//
+// For each segment:
+//   1. mmap(NULL, size, RWX, MAP_PRIVATE|MAP_ANON, -1, 0)  → tmp
+//   2. memcpy loop (LDP/STP pairs) from original addr to tmp
+//   3. mremap(tmp, size, size, MREMAP_MAYMOVE|MREMAP_FIXED, addr) → replaces
+//   4. mprotect(addr, size, original_prot)
+//   5. prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, addr, size, "jit-cache")
+// Then: restore registers, jump to original function.
+//
+// Segment descriptors (addr, size, prot) are embedded as data literals.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr uint16_t SYS_MMAP     = 0xDE;   // 222
+constexpr uint16_t SYS_MREMAP   = 0xD8;   // 216
+constexpr uint16_t SYS_MPROTECT = 0xE2;   // 226
+constexpr uint16_t SYS_PRCTL    = 0xA7;   // 167
+
+constexpr uint32_t MREMAP_MAYMOVE = 1;
+constexpr uint32_t MREMAP_FIXED  = 2;
+constexpr uint32_t PR_SET_VMA    = 0x53564d41;
+constexpr uint32_t PR_SET_VMA_ANON_NAME = 0;
+
+// B #byte_delta  (unconditional direct branch; delta must be multiple of 4,
+// range ±128 MB)
+void emit_b(std::vector<uint8_t>& b, int32_t byte_delta) {
+    const int32_t imm26 = byte_delta / 4;
+    emit32(b, 0x14000000U | (static_cast<uint32_t>(imm26) & 0x03FFFFFFU));
+}
+
+// LDR Xt, [Xn, #offset]  (unsigned offset, 64-bit load, offset must be mult of 8)
+void emit_ldr_x_uoff(std::vector<uint8_t>& b, int xt, int xn, uint32_t offset_bytes) {
+    const uint32_t imm12 = offset_bytes / 8U;
+    emit32(b, 0xF9400000U | ((imm12 & 0xFFFU) << 10U)
+                          | (static_cast<uint32_t>(xn & 0x1F) << 5U)
+                          | static_cast<uint32_t>(xt & 0x1F));
+}
+
+// LDR Wt, [Xn, #offset]  (unsigned offset, 32-bit load, offset must be mult of 4)
+void emit_ldr_w_uoff(std::vector<uint8_t>& b, int wt, int xn, uint32_t offset_bytes) {
+    const uint32_t imm12 = offset_bytes / 4U;
+    emit32(b, 0xB9400000U | ((imm12 & 0xFFFU) << 10U)
+                          | (static_cast<uint32_t>(xn & 0x1F) << 5U)
+                          | static_cast<uint32_t>(wt & 0x1F));
+}
+
+// ADD Xd, Xn, #imm12
+void emit_add_x_imm(std::vector<uint8_t>& b, int rd, int rn, uint32_t imm12) {
+    emit32(b, 0x91000000U | ((imm12 & 0xFFFU) << 10U)
+                          | (static_cast<uint32_t>(rn & 0x1F) << 5U)
+                          | static_cast<uint32_t>(rd & 0x1F));
+}
+
+// SUBS Xd, Xn, #imm12  (set flags)
+void emit_subs_x_imm(std::vector<uint8_t>& b, int rd, int rn, uint32_t imm12) {
+    emit32(b, 0xF1000000U | ((imm12 & 0xFFFU) << 10U)
+                          | (static_cast<uint32_t>(rn & 0x1F) << 5U)
+                          | static_cast<uint32_t>(rd & 0x1F));
+}
+
+// B.NE #byte_delta (conditional branch if not equal)
+void emit_bne(std::vector<uint8_t>& b, int32_t byte_delta) {
+    const int32_t imm19 = byte_delta / 4;
+    emit32(b, 0x54000001U | (static_cast<uint32_t>(imm19 & 0x7FFFF) << 5U));
+}
+
+// LDP X, X, [Xn], #16   (post-index load pair, bump Xn by 16)
+void emit_ldp_x_post(std::vector<uint8_t>& b, int xt1, int xt2, int xn) {
+    const int32_t imm7 = 16 / 8;
+    emit32(b, 0xA8C00000U | (static_cast<uint32_t>(imm7 & 0x7F) << 15U)
+                          | (static_cast<uint32_t>(xt2 & 0x1F) << 10U)
+                          | (static_cast<uint32_t>(xn  & 0x1F) << 5U)
+                          | static_cast<uint32_t>(xt1 & 0x1F));
+}
+
+// STP X, X, [Xn], #16   (post-index store pair, bump Xn by 16)
+void emit_stp_x_post(std::vector<uint8_t>& b, int xt1, int xt2, int xn) {
+    const int32_t imm7 = 16 / 8;
+    emit32(b, 0xA8800000U | (static_cast<uint32_t>(imm7 & 0x7F) << 15U)
+                          | (static_cast<uint32_t>(xt2 & 0x1F) << 10U)
+                          | (static_cast<uint32_t>(xn  & 0x1F) << 5U)
+                          | static_cast<uint32_t>(xt1 & 0x1F));
+}
+
+// LSR Xd, Xn, #shift  (logical shift right immediate)
+void emit_lsr_x(std::vector<uint8_t>& b, int rd, int rn, int shift) {
+    emit32(b, 0xD340FC00U | (static_cast<uint32_t>(shift & 0x3F) << 16U)
+                          | (static_cast<uint32_t>(rn & 0x1F) << 5U)
+                          | static_cast<uint32_t>(rd & 0x1F));
+}
+
+}  // anonymous namespace
+
+std::vector<uint8_t> hide_shellcode(const std::vector<SegmentInfo>& segments,
+                                     const std::size_t jmp_addr) {
+    // The shellcode iterates over an array of segment descriptors embedded
+    // in its data section.  Register allocation:
+    //   X19 = pointer to current segment descriptor
+    //   X20 = remaining segment count
+    //   X21 = scratch (current seg addr)
+    //   X22 = scratch (current seg size)
+    //   X23 = scratch (current seg prot)
+    //   X24 = scratch (tmp mmap result)
+    //
+    // We use callee-saved X19-X24 to survive SVC clobbers.  Stage-1 already
+    // saved all registers including these; we don't need to save/restore again.
+
+    std::vector<uint8_t> b;
+    b.reserve(1024 + segments.size() * 24);
+
+    // ---- Prologue: load descriptor array pointer and count ----
+    // instruction 0: ADR X19, ->seg_table   (patched after emitting)
+    const std::size_t adr_patch_pos = b.size();
+    emit32(b, 0);  // placeholder for ADR X19
+
+    // instruction 1: MOV X20, #seg_count
+    emit_movz_x(b, 20, static_cast<uint16_t>(segments.size()));
+
+    // ---- Loop header ----
+    // instruction 2: CBZ X20, ->done  (patched after emitting)
+    const std::size_t cbz_patch_pos = b.size();
+    emit32(b, 0);  // placeholder for CBZ X20
+
+    // ---- Load current segment descriptor (addr=8B, size=8B, prot=4B, pad=4B = 24B) ----
+    // instruction 3: LDR X21, [X19, #0]   (addr)
+    emit_ldr_x_uoff(b, 21, 19, 0);
+    // instruction 4: LDR X22, [X19, #8]   (size)
+    emit_ldr_x_uoff(b, 22, 19, 8);
+    // instruction 5: LDR W23, [X19, #16]  (prot)
+    emit_ldr_w_uoff(b, 23, 19, 16);
+
+    // ---- Step 1: mmap(NULL, size, RWX, MAP_PRIVATE|MAP_ANON, -1, 0) → X24 ----
+    // instruction 6
+    emit_movz_x(b, 0, 0);           // x0 = NULL
+    // instruction 7
+    emit_mov_xr(b, 1, 22);          // x1 = size
+    // instruction 8
+    emit_movz_x(b, 2, 7);           // x2 = PROT_RWX
+    // instruction 9
+    emit_movz_x(b, 3, 0x22);        // x3 = MAP_PRIVATE|MAP_ANON
+    // instruction 10
+    emit_mvn_xzr(b, 4);             // x4 = -1
+    // instruction 11
+    emit_movz_x(b, 5, 0);           // x5 = 0
+    // instruction 12
+    emit_movz_x(b, 8, SYS_MMAP);    // x8 = __NR_mmap
+    // instruction 13
+    emit_svc(b, 0);
+    // instruction 14
+    emit_mov_xr(b, 24, 0);          // X24 = tmp
+
+    // ---- Step 2: memcpy(tmp, orig, size)  — LDP/STP loop, 16 bytes per iteration ----
+    // We copy in 16-byte chunks; segments are always page-aligned so size is ≥ 4096
+    // and always a multiple of 16.
+    // instruction 15: MOV X0, X24   (dst cursor)
+    emit_mov_xr(b, 0, 24);
+    // instruction 16: MOV X1, X21   (src cursor)
+    emit_mov_xr(b, 1, 21);
+    // instruction 17: LSR X2, X22, #4   (count = size / 16)
+    emit_lsr_x(b, 2, 22, 4);
+
+    // copy_loop:
+    const std::size_t copy_loop_pc = b.size();
+    // instruction 18: LDP X3, X4, [X1], #16
+    emit_ldp_x_post(b, 3, 4, 1);
+    // instruction 19: STP X3, X4, [X0], #16
+    emit_stp_x_post(b, 3, 4, 0);
+    // instruction 20: SUBS X2, X2, #1
+    emit_subs_x_imm(b, 2, 2, 1);
+    // instruction 21: B.NE copy_loop
+    emit_bne(b, static_cast<int32_t>(copy_loop_pc) - static_cast<int32_t>(b.size()));
+
+    // ---- Step 3: mremap(tmp, size, size, MREMAP_MAYMOVE|MREMAP_FIXED, orig_addr) ----
+    // instruction 22: MOV X0, X24       (old_addr = tmp)
+    emit_mov_xr(b, 0, 24);
+    // instruction 23: MOV X1, X22       (old_size)
+    emit_mov_xr(b, 1, 22);
+    // instruction 24: MOV X2, X22       (new_size)
+    emit_mov_xr(b, 2, 22);
+    // instruction 25: MOV X3, #(MREMAP_MAYMOVE|MREMAP_FIXED)
+    emit_movz_x(b, 3, MREMAP_MAYMOVE | MREMAP_FIXED);
+    // instruction 26: MOV X4, X21       (new_addr = original addr)
+    emit_mov_xr(b, 4, 21);
+    // instruction 27: MOV X8, #__NR_mremap
+    emit_movz_x(b, 8, SYS_MREMAP);
+    // instruction 28: SVC #0
+    emit_svc(b, 0);
+
+    // ---- Step 4: mprotect(addr, size, original_prot) ----
+    // instruction 29: MOV X0, X21
+    emit_mov_xr(b, 0, 21);
+    // instruction 30: MOV X1, X22
+    emit_mov_xr(b, 1, 22);
+    // instruction 31: MOV X2, X23
+    emit_mov_xr(b, 2, 23);
+    // instruction 32: MOV X8, #__NR_mprotect
+    emit_movz_x(b, 8, SYS_MPROTECT);
+    // instruction 33: SVC #0
+    emit_svc(b, 0);
+
+    // ---- Step 5: prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, addr, size, "jit-cache") ----
+    // instruction 34: MOV X0, PR_SET_VMA  (0x53564d41)
+    emit_mov64_x(b, 0, PR_SET_VMA);
+    // instruction 35: MOV X1, PR_SET_VMA_ANON_NAME (0)
+    emit_movz_x(b, 1, PR_SET_VMA_ANON_NAME);
+    // instruction 36: MOV X2, X21  (addr)
+    emit_mov_xr(b, 2, 21);
+    // instruction 37: MOV X3, X22  (size)
+    emit_mov_xr(b, 3, 22);
+    // instruction 38: ADR X4, ->jit_cache_str  (patched later)
+    const std::size_t adr_str_patch_pos = b.size();
+    emit32(b, 0);  // placeholder for ADR X4
+
+    // instruction 39: MOV X8, #__NR_prctl
+    emit_movz_x(b, 8, SYS_PRCTL);
+    // instruction 40: SVC #0
+    emit_svc(b, 0);
+
+    // ---- Advance to next descriptor and loop ----
+    // instruction 41: ADD X19, X19, #24
+    emit_add_x_imm(b, 19, 19, 24);
+    // instruction 42: SUBS X20, X20, #1
+    emit_subs_x_imm(b, 20, 20, 1);
+
+    // instruction 43: B ->loop_header (instruction 2, the CBZ)
+    const std::size_t loop_header_pc = cbz_patch_pos;
+    emit_b(b, static_cast<int32_t>(loop_header_pc) - static_cast<int32_t>(b.size()));
+
+    // ---- done: ----
+    const std::size_t done_pc = b.size();
+
+    // Restore all saved registers and jump back
+    emit_restore_regs(b);   // 17 instructions
+
+    // LDR X8, ->oldfun
+    const std::size_t ldr_oldfun_pc = b.size();
+    emit32(b, 0);  // placeholder — patched after data section is laid out
+
+    // BR X8
+    emit_br_x(b, 8);
+
+    // ---- Data section ----
+    align4(b);
+
+    // "jit-cache\0" string
+    const std::size_t jit_cache_str_off = b.size();
+    static const char jit_str[] = "jit-cache";
+    b.insert(b.end(), jit_str, jit_str + sizeof(jit_str));
+    align4(b);
+
+    // oldfun qword
+    const std::size_t oldfun_off = b.size();
+    emit64(b, static_cast<uint64_t>(jmp_addr));
+
+    // Segment descriptor table: each entry is { addr: u64, size: u64, prot: u32, pad: u32 }
+    const std::size_t seg_table_off = b.size();
+    for (const auto& seg : segments) {
+        emit64(b, seg.addr);
+        emit64(b, seg.size);
+        emit32(b, seg.prot);
+        emit32(b, 0);  // padding
+    }
+
+    // ---- Patch placeholders ----
+    // ADR X19, ->seg_table  at adr_patch_pos
+    {
+        const int32_t delta = static_cast<int32_t>(seg_table_off) - static_cast<int32_t>(adr_patch_pos);
+        const uint32_t immlo = static_cast<uint32_t>(delta) & 0x3U;
+        const uint32_t immhi = static_cast<uint32_t>(delta >> 2) & 0x7FFFFU;
+        const uint32_t insn = 0x10000000U | (immlo << 29U) | (immhi << 5U) | 19U;
+        std::memcpy(b.data() + adr_patch_pos, &insn, 4);
+    }
+
+    // CBZ X20, ->done  at cbz_patch_pos
+    {
+        const int32_t delta = static_cast<int32_t>(done_pc) - static_cast<int32_t>(cbz_patch_pos);
+        const int32_t imm19 = delta / 4;
+        const uint32_t insn = 0xB4000000U | (static_cast<uint32_t>(imm19 & 0x7FFFF) << 5U) | 20U;
+        std::memcpy(b.data() + cbz_patch_pos, &insn, 4);
+    }
+
+    // ADR X4, ->jit_cache_str  at adr_str_patch_pos
+    {
+        const int32_t delta = static_cast<int32_t>(jit_cache_str_off) - static_cast<int32_t>(adr_str_patch_pos);
+        const uint32_t immlo = static_cast<uint32_t>(delta) & 0x3U;
+        const uint32_t immhi = static_cast<uint32_t>(delta >> 2) & 0x7FFFFU;
+        const uint32_t insn = 0x10000000U | (immlo << 29U) | (immhi << 5U) | 4U;
+        std::memcpy(b.data() + adr_str_patch_pos, &insn, 4);
+    }
+
+    // LDR X8, ->oldfun  at ldr_oldfun_pc
+    {
+        const int32_t delta = static_cast<int32_t>(oldfun_off) - static_cast<int32_t>(ldr_oldfun_pc);
+        const int32_t imm19 = delta / 4;
+        const uint32_t insn = 0x58000000U | (static_cast<uint32_t>(imm19 & 0x7FFFF) << 5U) | 8U;
+        std::memcpy(b.data() + ldr_oldfun_pc, &insn, 4);
+    }
+
+    return b;
+}
+
 // self_jmp – returns the 4-byte AArch64 encoding of "B #0" (branch to self).
 std::vector<uint8_t> self_jmp() {
     std::vector<uint8_t> b;

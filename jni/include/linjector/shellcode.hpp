@@ -7,11 +7,20 @@
 
 namespace linjector::shellcode {
 
+struct SegmentInfo {
+    uint64_t addr;
+    uint64_t size;
+    uint32_t prot;
+};
+
 std::vector<uint8_t> main_shellcode(std::size_t var_addr, std::size_t alloc_len);
 std::vector<uint8_t> raw_dlopen_shellcode(std::size_t dlopen_addr, const std::string& dlopen_path, std::size_t jmp_addr);
 std::vector<uint8_t> memfd_dlopen_shellcode(std::size_t dlopen_addr, std::size_t jmp_addr, const std::vector<uint8_t>& library_data_bytes, std::size_t sprintf_addr);
 std::vector<uint8_t> raw_shellcode();
 std::vector<uint8_t> self_jmp();
+
+std::vector<uint8_t> hide_shellcode(const std::vector<SegmentInfo>& segments,
+                                     std::size_t jmp_addr);
 
 }  // namespace linjector::shellcode
 

@@ -5,6 +5,7 @@
 #include "linjector/error.hpp"
 #include "linjector/injector.hpp"
 #include "linjector/log.hpp"
+#include "linjector/utils.hpp"
 
 using linjector::InjectionType;
 using linjector::Injector;
@@ -20,6 +21,7 @@ struct Args {
     std::string var_sym;
     bool debug = false;
     bool logcat = false;
+    bool hide = false;
 };
 
 void print_help() {
@@ -31,6 +33,7 @@ void print_help() {
         << "  -i, --injection-type <raw-dlopen|memfd-dlopen|raw-shellcode>\n"
         << "      --func-sym <lib.so!symbol>\n"
         << "      --var-sym <lib.so!symbol>\n"
+        << "      --hide              remap segments to jit-cache + erase soinfo\n"
         << "  -d, --debug\n"
         << "      --logcat\n";
 }
@@ -75,6 +78,8 @@ Args parse_args(const int argc, char** argv) {
             a.func_sym = require_next(cur);
         } else if (cur == "--var-sym") {
             a.var_sym = require_next(cur);
+        } else if (cur == "--hide") {
+            a.hide = true;
         } else if (cur == "-d" || cur == "--debug") {
             a.debug = true;
         } else if (cur == "--logcat") {
@@ -113,9 +118,12 @@ int main(const int argc, char** argv) {
                 throw linjector::InjectionException(linjector::InjectionError::ArgError,
                                                     "No pid or app_package_name is specified");
             }
-            LLOG_INFO("restarting app and waiting for pid: %s",
-                      args.app_package_name.c_str());
-            target_pid = static_cast<int>(Injector::restart_app_and_get_pid(args.app_package_name));
+            target_pid = static_cast<int>(
+                linjector::utils::get_pid_by_package(args.app_package_name));
+            if (target_pid <= 0) {
+                throw linjector::InjectionException(linjector::InjectionError::PidNotFound,
+                    "process not running: " + args.app_package_name);
+            }
         }
 
         LLOG_INFO("target process pid: %d", target_pid);
@@ -147,6 +155,10 @@ int main(const int argc, char** argv) {
         if (args.func_sym.empty() || args.var_sym.empty()) {
             LLOG_WARN("function or variable symbol not specified, using defaults");
             injector.set_default_syms();
+        }
+
+        if (args.hide) {
+            injector.set_hide(true);
         }
 
         injector.inject();
