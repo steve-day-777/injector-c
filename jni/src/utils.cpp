@@ -153,8 +153,9 @@ uint32_t get_pid_by_package(const std::string& pkg_name) {
             continue;
         }
         std::string cmdline((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
-        if (!cmdline.empty() && cmdline.back() == '\0') {
-            cmdline.pop_back();
+        const auto nul = cmdline.find('\0');
+        if (nul != std::string::npos) {
+            cmdline.resize(nul);
         }
         if (cmdline == pkg_name) {
             return static_cast<uint32_t>(std::stoul(name));
